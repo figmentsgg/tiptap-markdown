@@ -1,11 +1,74 @@
-import markdownit from 'markdown-it';
+import { marked } from 'marked';
 
-const md = markdownit();
+// Create a singleton instance of marked parser
+let markedInstance = null;
 
-function scanDelims(text, pos) {
-    md.inline.State.prototype.scanDelims.call({ src: text, posMax: text.length })
-    const state = new (md.inline.State)(text, null, null, []);
-    return state.scanDelims(pos, true);
+// Configure and get a marked parser instance
+export function getMarkedParser() {
+    if (!markedInstance) {
+        // Configure marked options
+        markedInstance = {
+            parse: (text) => marked.parse(text),
+            parseInline: (text) => marked.parseInline(text)
+        };
+    }
+    return markedInstance;
+}
+
+// Allow cleanup of the instance
+export function cleanupMarkedParser() {
+    markedInstance = null;
+}
+
+/**
+ * Implements CommonMark delimiter rules similar to markdown-it
+ * See: https://spec.commonmark.org/0.29/#emphasis-and-strong-emphasis
+ * 
+ * This tries to replicate the behavior of markdown-it's scanDelims function
+ * but without dependencies on markdown-it internals
+ */
+export function canDelimiterBeUsed(text, pos, isOpening) {
+    const char = text.charAt(pos);
+    
+    // Check if we're at the start or end of the text
+    const isAtStart = pos === 0;
+    const isAtEnd = pos === text.length - 1;
+    
+    // Get characters before and after (if they exist)
+    const prevChar = isAtStart ? ' ' : text.charAt(pos - 1);
+    const nextChar = isAtEnd ? ' ' : text.charAt(pos + 1);
+    
+    // Rule 1: For opening delimiters, left-flanking requires:
+    // - not followed by Unicode whitespace
+    // - not followed by punctuation, or
+    // - preceded by Unicode whitespace or punctuation
+    const isUnicodeWhitespace = /\s/.test(nextChar);
+    const isPunctuation = /[!"#$%&'()*+,\-./:;<=>?@[\\\]^_`{|}~]/.test(nextChar);
+    const isPrecededByWhitespaceOrPunct = /[\s!"#$%&'()*+,\-./:;<=>?@[\\\]^_`{|}~]/.test(prevChar);
+    
+    // Rule 2: For closing delimiters, right-flanking requires:
+    // - not preceded by Unicode whitespace
+    // - not preceded by punctuation, or
+    // - followed by Unicode whitespace or punctuation
+    const isPrecededByWhitespace = /\s/.test(prevChar);
+    const isPrecededByPunct = /[!"#$%&'()*+,\-./:;<=>?@[\\\]^_`{|}~]/.test(prevChar);
+    const isFollowedByWhitespaceOrPunct = /[\s!"#$%&'()*+,\-./:;<=>?@[\\\]^_`{|}~]/.test(nextChar);
+    
+    // Left flanking if not followed by whitespace and either:
+    // - not followed by punctuation, or
+    // - preceded by whitespace or punctuation
+    const isLeftFlanking = !isUnicodeWhitespace && 
+                          (!isPunctuation || isPrecededByWhitespaceOrPunct);
+    
+    // Right flanking if not preceded by whitespace and either:
+    // - not preceded by punctuation, or
+    // - followed by whitespace or punctuation
+    const isRightFlanking = !isPrecededByWhitespace &&
+                           (!isPrecededByPunct || isFollowedByWhitespaceOrPunct);
+    
+    // For opening delimiters we need left-flanking
+    // For closing delimiters we need right-flanking
+    return isOpening ? isLeftFlanking : isRightFlanking;
 }
 
 export function shiftDelim(text, delim, start, offset) {
@@ -17,7 +80,7 @@ export function shiftDelim(text, delim, start, offset) {
 function trimStart(text, delim, from, to) {
     let pos = from, res = text;
     while(pos < to) {
-        if(scanDelims(res, pos).can_open) {
+        if(canDelimiterBeUsed(res, pos, true)) {
             break;
         }
         res = shiftDelim(res, delim, pos, 1);
@@ -29,7 +92,7 @@ function trimStart(text, delim, from, to) {
 function trimEnd(text, delim, from, to) {
     let pos = to, res = text;
     while(pos > from) {
-        if(scanDelims(res, pos).can_close) {
+        if(canDelimiterBeUsed(res, pos, false)) {
             break;
         }
         res = shiftDelim(res, delim, pos, -1);

@@ -3,6 +3,7 @@ import { MarkdownTightLists } from "./extensions/tiptap/tight-lists";
 import { MarkdownSerializer } from "./serialize/MarkdownSerializer";
 import { MarkdownParser } from "./parse/MarkdownParser";
 import { MarkdownClipboard } from "./extensions/tiptap/clipboard";
+import { cleanupMarkedParser } from "./util/markdown";
 
 export const Markdown = Extension.create({
     name: 'markdown',
@@ -53,6 +54,21 @@ export const Markdown = Extension.create({
     onCreate() {
         this.editor.options.content = this.editor.options.initialContent;
         delete this.editor.options.initialContent;
+    },
+    onDestroy() {
+        // Clean up resources to prevent memory leaks
+        if (this.editor.storage.markdown) {
+            if (this.editor.storage.markdown.parser) {
+                this.editor.storage.markdown.parser.destroy();
+            }
+            if (this.editor.storage.markdown.serializer) {
+                this.editor.storage.markdown.serializer.destroy();
+            }
+            // Clean up other references
+            this.editor.storage.markdown = null;
+        }
+        // Clean up the global marked parser instance
+        cleanupMarkedParser();
     },
     addStorage() {
         return {

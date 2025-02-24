@@ -1,4 +1,4 @@
-import markdownit from "markdown-it";
+import { marked } from 'marked';
 import { elementFromString, extractElement, unwrapElement } from "../util/dom";
 import { getMarkdownSpec } from "../util/extensions";
 
@@ -8,28 +8,56 @@ export class MarkdownParser {
      */
     editor = null;
     /**
-     * @type {markdownit}
+     * @type {marked}
      */
-    md = null;
+    marked = null;
 
     constructor(editor, { html, linkify, breaks }) {
         this.editor = editor;
-        this.md = this.withPatchedRenderer(markdownit({
-            html,
-            linkify,
-            breaks,
-        }));
+        
+        // Configure marked options to match markdown-it behavior
+        marked.setOptions({
+            headerIds: false, // Don't add IDs to headings
+            mangle: false,    // Don't mangle header IDs
+            breaks: breaks,   // Line breaks behavior
+            gfm: true,        // GitHub Flavored Markdown
+            // Handle HTML option explicitly
+            html: html !== false, // Allow HTML by default to match markdown-it's default behavior when html=true
+            silent: false,
+            // In marked, linkify functionality is part of GFM
+            // But we can't separately control it like in markdown-it
+        });
+        
+        this.marked = {
+            parse: this.withPatchedRenderer(marked.parse),
+            parseInline: this.withPatchedRenderer(marked.parseInline)
+        };
+    }
+
+    /**
+     * Cleanup resources to prevent memory leaks
+     */
+    destroy() {
+        // Release references that could cause memory leaks
+        this.marked = null;
+        this.editor = null;
     }
 
     parse(content, { inline } = {}) {
         if(typeof content === 'string') {
+            // Allow extensions to modify the parser
             this.editor.extensionManager.extensions.forEach(extension =>
-                getMarkdownSpec(extension)?.parse?.setup?.call({ editor:this.editor, options:extension.options }, this.md)
+                getMarkdownSpec(extension)?.parse?.setup?.call({ editor:this.editor, options:extension.options }, marked)
             );
 
-            const renderedHTML = this.md.render(content);
+            // Parse markdown to HTML - use appropriate method based on context
+            const renderedHTML = inline 
+                ? this.marked.parseInline(content)
+                : this.marked.parse(content);
+                
             const element = elementFromString(renderedHTML);
 
+            // Allow extensions to modify the DOM
             this.editor.extensionManager.extensions.forEach(extension =>
                 getMarkdownSpec(extension)?.parse?.updateDOM?.call({ editor:this.editor, options:extension.options }, element)
             );
@@ -45,7 +73,7 @@ export class MarkdownParser {
     normalizeDOM(node, { inline, content }) {
         this.normalizeBlocks(node);
 
-        // remove all \n appended by markdown-it
+        // Remove trailing newlines from elements
         node.querySelectorAll('*').forEach(el => {
             if(el.nextSibling?.nodeType === Node.TEXT_NODE && !el.closest('pre')) {
                 el.nextSibling.textContent = el.nextSibling.textContent.replace(/^\n/, '');
@@ -101,27 +129,24 @@ export class MarkdownParser {
     }
 
     /**
-     * @param {markdownit} md
+     * Patch the renderer to handle newlines correctly
      */
-    withPatchedRenderer(md) {
-        const withoutNewLine = (renderer) => (...args) => {
-            const rendered = renderer(...args);
-            if(rendered === '\n') {
-                return rendered; // keep soft breaks
+    withPatchedRenderer(renderFn) {
+        return (text) => {
+            const rendered = renderFn(text);
+            
+            // Don't modify soft breaks
+            if (rendered === '\n') {
+                return rendered;
             }
-            if(rendered[rendered.length - 1] === '\n') {
+            
+            // Remove trailing newlines
+            if (rendered.endsWith('\n')) {
                 return rendered.slice(0, -1);
             }
+            
             return rendered;
-        }
-
-        md.renderer.rules.hardbreak = withoutNewLine(md.renderer.rules.hardbreak);
-        md.renderer.rules.softbreak = withoutNewLine(md.renderer.rules.softbreak);
-        md.renderer.rules.fence = withoutNewLine(md.renderer.rules.fence);
-        md.renderer.rules.code_block = withoutNewLine(md.renderer.rules.code_block);
-        md.renderer.renderToken = withoutNewLine(md.renderer.renderToken.bind(md.renderer));
-
-        return md;
+        };
     }
 }
 

@@ -14,6 +14,13 @@ export class MarkdownSerializer {
     constructor(editor) {
         this.editor = editor;
     }
+    
+    /**
+     * Clean up resources to prevent memory leaks
+     */
+    destroy() {
+        this.editor = null;
+    }
 
     serialize(content) {
         const state = new MarkdownSerializerState(this.nodes, this.marks, {

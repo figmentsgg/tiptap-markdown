@@ -17,7 +17,7 @@ export const MarkdownClipboard = Extension.create({
                 key: new PluginKey('markdownClipboard'),
                 props: {
                     clipboardTextParser: (text, context, plainText) => {
-                        if(plainText || !this.options.transformPastedText) {
+                        if(plainText || !this.options.transformPastedText || !this.editor.storage.markdown) {
                             return null; // pasting with shift key prevents formatting
                         }
                         const parsed = this.editor.storage.markdown.parser.parse(text, { inline: true });
@@ -31,7 +31,7 @@ export const MarkdownClipboard = Extension.create({
                      * @param {import('prosemirror-model').Slice} slice
                      */
                     clipboardTextSerializer: (slice) => {
-                        if(!this.options.transformCopiedText) {
+                        if(!this.options.transformCopiedText || !this.editor.storage.markdown) {
                             return null;
                         }
                         return this.editor.storage.markdown.serializer.serialize(slice.content);

@@ -1,0 +1,1167 @@
+var __defProp = Object.defineProperty;
+var __defNormalProp = (obj, key, value) => key in obj ? __defProp(obj, key, { enumerable: true, configurable: true, writable: true, value }) : obj[key] = value;
+var __publicField = (obj, key, value) => {
+  __defNormalProp(obj, typeof key !== "symbol" ? key + "" : key, value);
+  return value;
+};
+import { Extension, Mark, getHTMLFromFragment, Node as Node$1, extensions } from "@tiptap/core";
+import { MarkdownSerializerState as MarkdownSerializerState$1, defaultMarkdownSerializer } from "prosemirror-markdown";
+import { marked } from "marked";
+import { Fragment, DOMParser } from "@tiptap/pm/model";
+import { Plugin, PluginKey } from "@tiptap/pm/state";
+const MarkdownTightLists = Extension.create({
+  name: "markdownTightLists",
+  addOptions: () => ({
+    tight: true,
+    tightClass: "tight",
+    listTypes: ["bulletList", "orderedList"]
+  }),
+  addGlobalAttributes() {
+    return [{
+      types: this.options.listTypes,
+      attributes: {
+        tight: {
+          default: this.options.tight,
+          parseHTML: (element) => element.getAttribute("data-tight") === "true" || !element.querySelector("p"),
+          renderHTML: (attributes) => ({
+            class: attributes.tight ? this.options.tightClass : null,
+            "data-tight": attributes.tight ? "true" : null
+          })
+        }
+      }
+    }];
+  },
+  addCommands() {
+    var _this = this;
+    return {
+      toggleTight: function() {
+        let tight = arguments.length > 0 && arguments[0] !== void 0 ? arguments[0] : null;
+        return (_ref) => {
+          let {
+            editor,
+            commands
+          } = _ref;
+          function toggleTight(name) {
+            if (!editor.isActive(name)) {
+              return false;
+            }
+            const attrs = editor.getAttributes(name);
+            return commands.updateAttributes(name, {
+              tight: tight !== null && tight !== void 0 ? tight : !(attrs !== null && attrs !== void 0 && attrs.tight)
+            });
+          }
+          return _this.options.listTypes.some((name) => toggleTight(name));
+        };
+      }
+    };
+  }
+});
+const parserSymbol = Symbol("markedParser");
+function cleanupMarkedParser() {
+  if (globalThis[parserSymbol]) {
+    globalThis[parserSymbol] = null;
+  }
+}
+function canDelimiterBeUsed(text, pos, isOpening) {
+  if (!text || pos < 0 || pos >= text.length)
+    return false;
+  text.charAt(pos);
+  if (pos === 0)
+    return isOpening;
+  if (pos === text.length - 1)
+    return !isOpening;
+  const prevCharCode = text.charCodeAt(pos - 1);
+  const nextCharCode = text.charCodeAt(pos + 1);
+  const isPrevWhitespace = prevCharCode <= 32;
+  const isNextWhitespace = nextCharCode <= 32;
+  const isPrevPunctuation = isPunctuation(prevCharCode);
+  const isNextPunctuation = isPunctuation(nextCharCode);
+  if (isOpening) {
+    return !isNextWhitespace && (!isNextPunctuation || isPrevWhitespace || isPrevPunctuation);
+  } else {
+    return !isPrevWhitespace && (!isPrevPunctuation || isNextWhitespace || isNextPunctuation);
+  }
+}
+function isPunctuation(charCode) {
+  return charCode >= 33 && charCode <= 47 || // ! " # $ % & ' ( ) * + , - . /
+  charCode >= 58 && charCode <= 64 || // : ; < = > ? @
+  charCode >= 91 && charCode <= 96 || // [ \ ] ^ _ `
+  charCode >= 123 && charCode <= 126;
+}
+function shiftDelim(text, delim, start, offset) {
+  return text.substring(0, start) + text.substring(start + delim.length, start + offset) + delim + text.substring(start + offset);
+}
+function trimStart(text, delim, from, to) {
+  if (from >= to)
+    return {
+      text,
+      from,
+      to
+    };
+  let pos = from, res = text;
+  const maxIterations = to - from;
+  let iterations = 0;
+  while (pos < to && iterations < maxIterations) {
+    if (canDelimiterBeUsed(res, pos, true)) {
+      break;
+    }
+    res = shiftDelim(res, delim, pos, 1);
+    pos++;
+    iterations++;
+  }
+  return {
+    text: res,
+    from: pos,
+    to
+  };
+}
+function trimEnd(text, delim, from, to) {
+  if (from >= to)
+    return {
+      text,
+      from,
+      to
+    };
+  let pos = to, res = text;
+  const maxIterations = to - from;
+  let iterations = 0;
+  while (pos > from && iterations < maxIterations) {
+    if (canDelimiterBeUsed(res, pos, false)) {
+      break;
+    }
+    res = shiftDelim(res, delim, pos, -1);
+    pos--;
+    iterations++;
+  }
+  return {
+    text: res,
+    from,
+    to: pos
+  };
+}
+function trimInline(text, delim, from, to) {
+  if (!text || from < 0 || to >= text.length || from >= to) {
+    return text;
+  }
+  try {
+    let state = {
+      text,
+      from,
+      to
+    };
+    state = trimStart(state.text, delim, state.from, state.to);
+    state = trimEnd(state.text, delim, state.from, state.to);
+    if (state.to - state.from < delim.length + 1) {
+      state.text = state.text.substring(0, state.from) + state.text.substring(state.to + delim.length);
+    }
+    return state.text;
+  } catch (e) {
+    console.error("Error in trimInline:", e);
+    return text;
+  }
+}
+class MarkdownSerializerState extends MarkdownSerializerState$1 {
+  constructor(nodes, marks, options) {
+    super(nodes, marks, options !== null && options !== void 0 ? options : {});
+    __publicField(this, "inTable", false);
+    this.inlines = [];
+  }
+  render(node, parent, index) {
+    super.render(node, parent, index);
+    const top = this.inlines[this.inlines.length - 1];
+    if (top !== null && top !== void 0 && top.start && top !== null && top !== void 0 && top.end) {
+      const {
+        delimiter,
+        start,
+        end
+      } = this.normalizeInline(top);
+      this.out = trimInline(this.out, delimiter, start, end);
+      this.inlines.pop();
+    }
+  }
+  markString(mark, open, parent, index) {
+    const info = this.marks[mark.type.name];
+    if (info.expelEnclosingWhitespace) {
+      if (open) {
+        this.inlines.push({
+          start: this.out.length,
+          delimiter: info.open
+        });
+      } else {
+        const top = this.inlines.pop();
+        this.inlines.push({
+          ...top,
+          end: this.out.length
+        });
+      }
+    }
+    return super.markString(mark, open, parent, index);
+  }
+  normalizeInline(inline) {
+    let {
+      start,
+      end
+    } = inline;
+    while (this.out.charAt(start).match(/\s/)) {
+      start++;
+    }
+    return {
+      ...inline,
+      start
+    };
+  }
+}
+const HTMLMark = Mark.create({
+  name: "markdownHTMLMark",
+  /**
+   * @return {{markdown: MarkdownMarkSpec}}
+   */
+  addStorage() {
+    return {
+      markdown: {
+        serialize: {
+          open(state, mark) {
+            var _getMarkTags$, _getMarkTags;
+            if (!this.editor.storage.markdown.options.html) {
+              console.warn(`Tiptap Markdown: "${mark.type.name}" mark is only available in html mode`);
+              return "";
+            }
+            return (_getMarkTags$ = (_getMarkTags = getMarkTags(mark)) === null || _getMarkTags === void 0 ? void 0 : _getMarkTags[0]) !== null && _getMarkTags$ !== void 0 ? _getMarkTags$ : "";
+          },
+          close(state, mark) {
+            var _getMarkTags$2, _getMarkTags2;
+            if (!this.editor.storage.markdown.options.html) {
+              return "";
+            }
+            return (_getMarkTags$2 = (_getMarkTags2 = getMarkTags(mark)) === null || _getMarkTags2 === void 0 ? void 0 : _getMarkTags2[1]) !== null && _getMarkTags$2 !== void 0 ? _getMarkTags$2 : "";
+          }
+        },
+        parse: {
+          // handled by markdown-it
+        }
+      }
+    };
+  }
+});
+function getMarkTags(mark) {
+  const schema = mark.type.schema;
+  const node = schema.text(" ", [mark]);
+  const html = getHTMLFromFragment(Fragment.from(node), schema);
+  const match = html.match(/^(<.*?>) (<\/.*?>)$/);
+  return match ? [match[1], match[2]] : null;
+}
+function elementFromString(value) {
+  const wrappedValue = `<body>${value}</body>`;
+  return new window.DOMParser().parseFromString(wrappedValue, "text/html").body;
+}
+function escapeHTML(value) {
+  return value === null || value === void 0 ? void 0 : value.replace(/</g, "&lt;").replace(/>/g, "&gt;");
+}
+function extractElement(node) {
+  const parent = node.parentElement;
+  const prepend = parent.cloneNode();
+  while (parent.firstChild && parent.firstChild !== node) {
+    prepend.appendChild(parent.firstChild);
+  }
+  if (prepend.childNodes.length > 0) {
+    parent.parentElement.insertBefore(prepend, parent);
+  }
+  parent.parentElement.insertBefore(node, parent);
+  if (parent.childNodes.length === 0) {
+    parent.remove();
+  }
+}
+function unwrapElement(node) {
+  const parent = node.parentNode;
+  while (node.firstChild)
+    parent.insertBefore(node.firstChild, node);
+  parent.removeChild(node);
+}
+const HTMLNode = Node$1.create({
+  name: "markdownHTMLNode",
+  addStorage() {
+    return {
+      markdown: {
+        serialize(state, node, parent) {
+          if (this.editor.storage.markdown.options.html) {
+            state.write(serializeHTML(node, parent));
+          } else {
+            console.warn(`Tiptap Markdown: "${node.type.name}" node is only available in html mode`);
+            state.write(`[${node.type.name}]`);
+          }
+          if (node.isBlock) {
+            state.closeBlock(node);
+          }
+        },
+        parse: {
+          // handled by markdown-it
+        }
+      }
+    };
+  }
+});
+function serializeHTML(node, parent) {
+  const schema = node.type.schema;
+  const html = getHTMLFromFragment(Fragment.from(node), schema);
+  if (node.isBlock && (parent instanceof Fragment || parent.type.name === schema.topNodeType.name)) {
+    return formatBlock(html);
+  }
+  return html;
+}
+function formatBlock(html) {
+  const dom = elementFromString(html);
+  const element = dom.firstElementChild;
+  element.innerHTML = element.innerHTML.trim() ? `
+${element.innerHTML}
+` : `
+`;
+  return element.outerHTML;
+}
+const Blockquote = Node$1.create({
+  name: "blockquote"
+});
+const Blockquote$1 = Blockquote.extend({
+  /**
+   * @return {{markdown: MarkdownNodeSpec}}
+   */
+  addStorage() {
+    return {
+      markdown: {
+        serialize: defaultMarkdownSerializer.nodes.blockquote,
+        parse: {
+          // handled by markdown-it
+        }
+      }
+    };
+  }
+});
+const BulletList = Node$1.create({
+  name: "bulletList"
+});
+const BulletList$1 = BulletList.extend({
+  /**
+   * @return {{markdown: MarkdownNodeSpec}}
+   */
+  addStorage() {
+    return {
+      markdown: {
+        serialize(state, node) {
+          return state.renderList(node, "  ", () => (this.editor.storage.markdown.options.bulletListMarker || "-") + " ");
+        },
+        parse: {
+          // handled by markdown-it
+        }
+      }
+    };
+  }
+});
+const CodeBlock = Node$1.create({
+  name: "codeBlock"
+});
+const CodeBlock$1 = CodeBlock.extend({
+  /**
+   * @return {{markdown: MarkdownNodeSpec}}
+   */
+  addStorage() {
+    return {
+      markdown: {
+        serialize(state, node) {
+          state.write("```" + (node.attrs.language || "") + "\n");
+          state.text(node.textContent, false);
+          state.ensureNewLine();
+          state.write("```");
+          state.closeBlock(node);
+        },
+        parse: {
+          setup(marked2) {
+            var _this$options$languag;
+            const langPrefix = (_this$options$languag = this.options.languageClassPrefix) !== null && _this$options$languag !== void 0 ? _this$options$languag : "language-";
+            if (langPrefix !== "language-") {
+              marked2.setOptions({
+                langPrefix
+              });
+            }
+          },
+          updateDOM(element) {
+            element.innerHTML = element.innerHTML.replace(/\n<\/code><\/pre>/g, "</code></pre>");
+          }
+        }
+      }
+    };
+  }
+});
+const HardBreak = Node$1.create({
+  name: "hardBreak"
+});
+const HardBreak$1 = HardBreak.extend({
+  /**
+   * @return {{markdown: MarkdownNodeSpec}}
+   */
+  addStorage() {
+    return {
+      markdown: {
+        serialize(state, node, parent, index) {
+          for (let i = index + 1; i < parent.childCount; i++)
+            if (parent.child(i).type != node.type) {
+              state.write(state.inTable ? HTMLNode.storage.markdown.serialize.call(this, state, node, parent) : "\\\n");
+              return;
+            }
+        },
+        parse: {
+          // handled by markdown-it
+        }
+      }
+    };
+  }
+});
+const Heading = Node$1.create({
+  name: "heading"
+});
+const Heading$1 = Heading.extend({
+  /**
+   * @return {{markdown: MarkdownNodeSpec}}
+   */
+  addStorage() {
+    return {
+      markdown: {
+        serialize: defaultMarkdownSerializer.nodes.heading,
+        parse: {
+          // handled by markdown-it
+        }
+      }
+    };
+  }
+});
+const HorizontalRule = Node$1.create({
+  name: "horizontalRule"
+});
+const HorizontalRule$1 = HorizontalRule.extend({
+  /**
+   * @return {{markdown: MarkdownNodeSpec}}
+   */
+  addStorage() {
+    return {
+      markdown: {
+        serialize: defaultMarkdownSerializer.nodes.horizontal_rule,
+        parse: {
+          // handled by markdown-it
+        }
+      }
+    };
+  }
+});
+const Image = Node$1.create({
+  name: "image"
+});
+const Image$1 = Image.extend({
+  /**
+   * @return {{markdown: MarkdownNodeSpec}}
+   */
+  addStorage() {
+    return {
+      markdown: {
+        serialize: defaultMarkdownSerializer.nodes.image,
+        parse: {
+          // handled by markdown-it
+        }
+      }
+    };
+  }
+});
+const ListItem = Node$1.create({
+  name: "listItem"
+});
+const ListItem$1 = ListItem.extend({
+  /**
+   * @return {{markdown: MarkdownNodeSpec}}
+   */
+  addStorage() {
+    return {
+      markdown: {
+        serialize: defaultMarkdownSerializer.nodes.list_item,
+        parse: {
+          // handled by markdown-it
+        }
+      }
+    };
+  }
+});
+const OrderedList = Node$1.create({
+  name: "orderedList"
+});
+function findIndexOfAdjacentNode(node, parent, index) {
+  let i = 0;
+  for (; index - i > 0; i++) {
+    if (parent.child(index - i - 1).type.name !== node.type.name) {
+      break;
+    }
+  }
+  return i;
+}
+const OrderedList$1 = OrderedList.extend({
+  /**
+   * @return {{markdown: MarkdownNodeSpec}}
+   */
+  addStorage() {
+    return {
+      markdown: {
+        serialize(state, node, parent, index) {
+          const start = node.attrs.start || 1;
+          const maxW = String(start + node.childCount - 1).length;
+          const space = state.repeat(" ", maxW + 2);
+          const adjacentIndex = findIndexOfAdjacentNode(node, parent, index);
+          const separator = adjacentIndex % 2 ? ") " : ". ";
+          state.renderList(node, space, (i) => {
+            const nStr = String(start + i);
+            return state.repeat(" ", maxW - nStr.length) + nStr + separator;
+          });
+        },
+        parse: {
+          // handled by markdown-it
+        }
+      }
+    };
+  }
+});
+const Paragraph = Node$1.create({
+  name: "paragraph"
+});
+const Paragraph$1 = Paragraph.extend({
+  /**
+   * @return {{markdown: MarkdownNodeSpec}}
+   */
+  addStorage() {
+    return {
+      markdown: {
+        serialize: defaultMarkdownSerializer.nodes.paragraph,
+        parse: {
+          // handled by markdown-it
+        }
+      }
+    };
+  }
+});
+function childNodes(node) {
+  var _node$content$content, _node$content;
+  return (_node$content$content = node === null || node === void 0 || (_node$content = node.content) === null || _node$content === void 0 ? void 0 : _node$content.content) !== null && _node$content$content !== void 0 ? _node$content$content : [];
+}
+const Table = Node$1.create({
+  name: "table"
+});
+const Table$1 = Table.extend({
+  /**
+   * @return {{markdown: MarkdownNodeSpec}}
+   */
+  addStorage() {
+    return {
+      markdown: {
+        serialize(state, node, parent) {
+          if (!isMarkdownSerializable(node)) {
+            HTMLNode.storage.markdown.serialize.call(this, state, node, parent);
+            return;
+          }
+          state.inTable = true;
+          node.forEach((row, p, i) => {
+            state.write("| ");
+            row.forEach((col, p2, j) => {
+              if (j) {
+                state.write(" | ");
+              }
+              const cellContent = col.firstChild;
+              if (cellContent.textContent.trim()) {
+                state.renderInline(cellContent);
+              }
+            });
+            state.write(" |");
+            state.ensureNewLine();
+            if (!i) {
+              const delimiterRow = Array.from({
+                length: row.childCount
+              }).map(() => "---").join(" | ");
+              state.write(`| ${delimiterRow} |`);
+              state.ensureNewLine();
+            }
+          });
+          state.closeBlock(node);
+          state.inTable = false;
+        },
+        parse: {
+          // handled by markdown-it
+        }
+      }
+    };
+  }
+});
+function hasSpan(node) {
+  return node.attrs.colspan > 1 || node.attrs.rowspan > 1;
+}
+function isMarkdownSerializable(node) {
+  const rows = childNodes(node);
+  const firstRow = rows[0];
+  const bodyRows = rows.slice(1);
+  if (childNodes(firstRow).some((cell) => cell.type.name !== "tableHeader" || hasSpan(cell) || cell.childCount > 1)) {
+    return false;
+  }
+  if (bodyRows.some((row) => childNodes(row).some((cell) => cell.type.name === "tableHeader" || hasSpan(cell) || cell.childCount > 1))) {
+    return false;
+  }
+  return true;
+}
+const Text = Node$1.create({
+  name: "text"
+});
+const Text$1 = Text.extend({
+  /**
+   * @return {{markdown: MarkdownNodeSpec}}
+   */
+  addStorage() {
+    return {
+      markdown: {
+        serialize(state, node) {
+          state.text(escapeHTML(node.text));
+        },
+        parse: {
+          // handled by markdown-it
+        }
+      }
+    };
+  }
+});
+const Bold = Mark.create({
+  name: "bold"
+});
+const Bold$1 = Bold.extend({
+  /**
+   * @return {{markdown: MarkdownMarkSpec}}
+   */
+  addStorage() {
+    return {
+      markdown: {
+        serialize: defaultMarkdownSerializer.marks.strong,
+        parse: {
+          // handled by markdown-it
+        }
+      }
+    };
+  }
+});
+const Code = Mark.create({
+  name: "code"
+});
+const Code$1 = Code.extend({
+  /**
+   * @return {{markdown: MarkdownMarkSpec}}
+   */
+  addStorage() {
+    return {
+      markdown: {
+        serialize: defaultMarkdownSerializer.marks.code,
+        parse: {
+          // handled by markdown-it
+        }
+      }
+    };
+  }
+});
+const Italic = Mark.create({
+  name: "italic"
+});
+const Italic$1 = Italic.extend({
+  /**
+   * @return {{markdown: MarkdownMarkSpec}}
+   */
+  addStorage() {
+    return {
+      markdown: {
+        serialize: defaultMarkdownSerializer.marks.em,
+        parse: {
+          // handled by markdown-it
+        }
+      }
+    };
+  }
+});
+const Link = Mark.create({
+  name: "link"
+});
+const Link$1 = Link.extend({
+  /**
+   * @return {{markdown: MarkdownMarkSpec}}
+   */
+  addStorage() {
+    return {
+      markdown: {
+        serialize: defaultMarkdownSerializer.marks.link,
+        parse: {
+          // handled by markdown-it
+        }
+      }
+    };
+  }
+});
+const Strike = Mark.create({
+  name: "strike"
+});
+const Strike$1 = Strike.extend({
+  /**
+   * @return {{markdown: MarkdownMarkSpec}}
+   */
+  addStorage() {
+    return {
+      markdown: {
+        serialize: {
+          open: "~~",
+          close: "~~",
+          expelEnclosingWhitespace: true
+        },
+        parse: {
+          // handled by markdown-it
+        }
+      }
+    };
+  }
+});
+const markdownExtensions = [Blockquote$1, BulletList$1, CodeBlock$1, HardBreak$1, Heading$1, HorizontalRule$1, HTMLNode, Image$1, ListItem$1, OrderedList$1, Paragraph$1, Table$1, Text$1, Bold$1, Code$1, HTMLMark, Italic$1, Link$1, Strike$1];
+function getMarkdownSpec(extension) {
+  var _extension$storage, _markdownExtensions$f;
+  const markdownSpec = (_extension$storage = extension.storage) === null || _extension$storage === void 0 ? void 0 : _extension$storage.markdown;
+  const defaultMarkdownSpec = (_markdownExtensions$f = markdownExtensions.find((e) => e.name === extension.name)) === null || _markdownExtensions$f === void 0 ? void 0 : _markdownExtensions$f.storage.markdown;
+  if (markdownSpec || defaultMarkdownSpec) {
+    return {
+      ...defaultMarkdownSpec,
+      ...markdownSpec
+    };
+  }
+  return null;
+}
+class MarkdownSerializer {
+  constructor(editor) {
+    /**
+     * @type {import('@tiptap/core').Editor}
+     */
+    __publicField(this, "editor", null);
+    this.editor = editor;
+  }
+  /**
+   * Clean up resources to prevent memory leaks
+   */
+  destroy() {
+    this.editor = null;
+  }
+  serialize(content) {
+    const state = new MarkdownSerializerState(this.nodes, this.marks, {
+      hardBreakNodeName: HardBreak$1.name
+    });
+    state.renderContent(content);
+    return state.out;
+  }
+  get nodes() {
+    var _this$editor$extensio;
+    return {
+      ...Object.fromEntries(Object.keys(this.editor.schema.nodes).map((name) => [name, this.serializeNode(HTMLNode)])),
+      ...Object.fromEntries((_this$editor$extensio = this.editor.extensionManager.extensions.filter((extension) => extension.type === "node" && this.serializeNode(extension)).map((extension) => [extension.name, this.serializeNode(extension)])) !== null && _this$editor$extensio !== void 0 ? _this$editor$extensio : [])
+    };
+  }
+  get marks() {
+    var _this$editor$extensio2;
+    return {
+      ...Object.fromEntries(Object.keys(this.editor.schema.marks).map((name) => [name, this.serializeMark(HTMLMark)])),
+      ...Object.fromEntries((_this$editor$extensio2 = this.editor.extensionManager.extensions.filter((extension) => extension.type === "mark" && this.serializeMark(extension)).map((extension) => [extension.name, this.serializeMark(extension)])) !== null && _this$editor$extensio2 !== void 0 ? _this$editor$extensio2 : [])
+    };
+  }
+  serializeNode(node) {
+    var _getMarkdownSpec;
+    return (_getMarkdownSpec = getMarkdownSpec(node)) === null || _getMarkdownSpec === void 0 || (_getMarkdownSpec = _getMarkdownSpec.serialize) === null || _getMarkdownSpec === void 0 ? void 0 : _getMarkdownSpec.bind({
+      editor: this.editor,
+      options: node.options
+    });
+  }
+  serializeMark(mark) {
+    var _getMarkdownSpec2;
+    const serialize = (_getMarkdownSpec2 = getMarkdownSpec(mark)) === null || _getMarkdownSpec2 === void 0 ? void 0 : _getMarkdownSpec2.serialize;
+    return serialize ? {
+      ...serialize,
+      open: typeof serialize.open === "function" ? serialize.open.bind({
+        editor: this.editor,
+        options: mark.options
+      }) : serialize.open,
+      close: typeof serialize.close === "function" ? serialize.close.bind({
+        editor: this.editor,
+        options: mark.options
+      }) : serialize.close
+    } : null;
+  }
+}
+const blockSelectorCache = /* @__PURE__ */ new WeakMap();
+class MarkdownParser {
+  constructor(editor, _ref) {
+    /**
+     * @type {import('@tiptap/core').Editor}
+     */
+    __publicField(this, "editor", null);
+    // Track destruction state
+    __publicField(this, "destroyed", false);
+    // Use a function-based approach instead of storing the parser
+    __publicField(this, "parseMarkdown", null);
+    __publicField(this, "parseMarkdownInline", null);
+    let {
+      html,
+      linkify,
+      breaks
+    } = _ref;
+    this.editor = editor;
+    const markedOptions = {
+      headerIds: false,
+      // Don't add IDs to headings
+      mangle: false,
+      // Don't mangle header IDs
+      breaks,
+      // Line breaks behavior
+      gfm: true,
+      // GitHub Flavored Markdown
+      linkify,
+      // Linkify functionality
+      // Handle HTML option explicitly
+      html: html !== false,
+      // Allow HTML by default to match markdown-it's default behavior when html=true
+      silent: false
+      // In marked, linkify functionality is part of GFM
+    };
+    this.parseMarkdown = this.withPatchedRenderer((text) => {
+      marked.setOptions(markedOptions);
+      return marked.parse(text);
+    });
+    this.parseMarkdownInline = this.withPatchedRenderer((text) => {
+      marked.setOptions(markedOptions);
+      return marked.parseInline(text);
+    });
+    this.destroyHandler = () => this.destroy();
+    this.editor.on("destroy", this.destroyHandler);
+  }
+  /**
+   * Cleanup resources to prevent memory leaks
+   */
+  destroy() {
+    if (this.destroyed)
+      return;
+    this.destroyed = true;
+    if (this.editor && this.destroyHandler) {
+      this.editor.off("destroy", this.destroyHandler);
+      this.destroyHandler = null;
+    }
+    this.parseMarkdown = null;
+    this.parseMarkdownInline = null;
+    this.editor = null;
+    cleanupMarkedParser();
+  }
+  parse(content) {
+    let {
+      inline
+    } = arguments.length > 1 && arguments[1] !== void 0 ? arguments[1] : {};
+    if (this.destroyed)
+      return content;
+    if (typeof content === "string") {
+      try {
+        const renderedHTML = inline ? this.parseMarkdownInline(content) : this.parseMarkdown(content);
+        const element = elementFromString(renderedHTML);
+        const extensions2 = this.editor.extensionManager.extensions;
+        for (let i = 0; i < extensions2.length; i++) {
+          var _spec$parse;
+          const extension = extensions2[i];
+          const spec = getMarkdownSpec(extension);
+          if (spec !== null && spec !== void 0 && (_spec$parse = spec.parse) !== null && _spec$parse !== void 0 && _spec$parse.updateDOM) {
+            spec.parse.updateDOM.call({
+              editor: this.editor,
+              options: extension.options
+            }, element);
+          }
+        }
+        this.normalizeDOM(element, {
+          inline,
+          content
+        });
+        const result = element.innerHTML;
+        return result;
+      } catch (e) {
+        console.error("Error parsing markdown:", e);
+        return content;
+      }
+    }
+    return content;
+  }
+  normalizeDOM(node, _ref2) {
+    let {
+      inline,
+      content
+    } = _ref2;
+    if (!node || this.destroyed)
+      return node;
+    try {
+      this.normalizeBlocks(node);
+      const elements = node.querySelectorAll("*");
+      for (let i = 0; i < elements.length; i++) {
+        const el = elements[i];
+        const nextSibling = el.nextSibling;
+        if ((nextSibling === null || nextSibling === void 0 ? void 0 : nextSibling.nodeType) === Node.TEXT_NODE && !el.closest("pre")) {
+          nextSibling.textContent = nextSibling.textContent.replace(/^\n/, "");
+        }
+      }
+      if (inline) {
+        this.normalizeInline(node, content);
+      }
+      return node;
+    } catch (e) {
+      console.error("Error normalizing DOM:", e);
+      return node;
+    }
+  }
+  normalizeBlocks(node) {
+    let selector = null;
+    if (!blockSelectorCache.has(this.editor.schema)) {
+      const blocks = Object.values(this.editor.schema.nodes).filter((node2) => node2.isBlock);
+      selector = blocks.map((block) => {
+        var _block$spec$parseDOM;
+        return (_block$spec$parseDOM = block.spec.parseDOM) === null || _block$spec$parseDOM === void 0 ? void 0 : _block$spec$parseDOM.map((spec) => spec.tag);
+      }).flat().filter(Boolean).join(",");
+      blockSelectorCache.set(this.editor.schema, selector);
+    } else {
+      selector = blockSelectorCache.get(this.editor.schema);
+    }
+    if (!selector) {
+      return;
+    }
+    const elements = node.querySelectorAll(selector);
+    for (let i = 0; i < elements.length; i++) {
+      var _el$parentElement;
+      const el = elements[i];
+      if ((_el$parentElement = el.parentElement) !== null && _el$parentElement !== void 0 && _el$parentElement.matches("p")) {
+        extractElement(el);
+      }
+    }
+  }
+  normalizeInline(node, content) {
+    var _node$firstElementChi;
+    if ((_node$firstElementChi = node.firstElementChild) !== null && _node$firstElementChi !== void 0 && _node$firstElementChi.matches("p")) {
+      const firstParagraph = node.firstElementChild;
+      const nextElementSibling = firstParagraph.nextElementSibling;
+      let startSpaces = "";
+      let endSpaces = "";
+      const startMatch = /^\s+/.exec(content);
+      if (startMatch)
+        startSpaces = startMatch[0];
+      if (!nextElementSibling) {
+        const endMatch = /\s+$/.exec(content);
+        if (endMatch)
+          endSpaces = endMatch[0];
+      }
+      if (/^\n\n/.test(content)) {
+        firstParagraph.innerHTML = `${firstParagraph.innerHTML}${endSpaces}`;
+        return;
+      }
+      unwrapElement(firstParagraph);
+      node.innerHTML = `${startSpaces}${node.innerHTML}${endSpaces}`;
+    }
+  }
+  /**
+   * Patch the renderer to handle newlines correctly
+   */
+  withPatchedRenderer(renderFn) {
+    return (text) => {
+      try {
+        const rendered = renderFn(text);
+        if (rendered === "\n") {
+          return rendered;
+        }
+        if (rendered.endsWith("\n")) {
+          return rendered.slice(0, -1);
+        }
+        return rendered;
+      } catch (e) {
+        console.error("Error in renderer:", e);
+        return text;
+      }
+    };
+  }
+}
+const MarkdownClipboard = Extension.create({
+  name: "markdownClipboard",
+  addOptions() {
+    return {
+      transformPastedText: false,
+      transformCopiedText: false
+    };
+  },
+  addProseMirrorPlugins() {
+    return [new Plugin({
+      key: new PluginKey("markdownClipboard"),
+      props: {
+        clipboardTextParser: (text, context, plainText) => {
+          if (plainText || !this.options.transformPastedText || !this.editor.storage.markdown) {
+            return null;
+          }
+          const parsed = this.editor.storage.markdown.parser.parse(text, {
+            inline: true
+          });
+          return DOMParser.fromSchema(this.editor.schema).parseSlice(elementFromString(parsed), {
+            preserveWhitespace: true,
+            context
+          });
+        },
+        /**
+         * @param {import('prosemirror-model').Slice} slice
+         */
+        clipboardTextSerializer: (slice) => {
+          if (!this.options.transformCopiedText || !this.editor.storage.markdown) {
+            return null;
+          }
+          return this.editor.storage.markdown.serializer.serialize(slice.content);
+        }
+      }
+    })];
+  }
+});
+const activeExtensions = /* @__PURE__ */ new Set();
+let globalCleanupTimer = null;
+function scheduleGlobalCleanup() {
+  if (globalCleanupTimer) {
+    clearTimeout(globalCleanupTimer);
+  }
+  globalCleanupTimer = setTimeout(() => {
+    activeExtensions.forEach((weakRef) => {
+      const extension = weakRef.deref();
+      if (!extension || !extension.editor) {
+        activeExtensions.delete(weakRef);
+      }
+    });
+    if (activeExtensions.size === 0) {
+      cleanupMarkedParser();
+    }
+    globalCleanupTimer = null;
+  }, 3e4);
+}
+const Markdown = Extension.create({
+  name: "markdown",
+  priority: 50,
+  addOptions() {
+    return {
+      html: true,
+      tightLists: true,
+      tightListClass: "tight",
+      bulletListMarker: "-",
+      linkify: false,
+      breaks: false,
+      transformPastedText: false,
+      transformCopiedText: false
+    };
+  },
+  addCommands() {
+    const commands = extensions.Commands.config.addCommands();
+    return {
+      setContent: (content, emitUpdate, parseOptions) => (props) => {
+        var _props$editor;
+        if (!((_props$editor = props.editor) !== null && _props$editor !== void 0 && (_props$editor = _props$editor.storage) !== null && _props$editor !== void 0 && (_props$editor = _props$editor.markdown) !== null && _props$editor !== void 0 && _props$editor.parser))
+          return false;
+        try {
+          const html = props.editor.storage.markdown.parser.parse(content);
+          return commands.setContent(html, emitUpdate, parseOptions)(props);
+        } catch (e) {
+          console.error("Error setting content:", e);
+          return false;
+        }
+      },
+      insertContentAt: (range, content, options) => (props) => {
+        var _props$editor2;
+        if (!((_props$editor2 = props.editor) !== null && _props$editor2 !== void 0 && (_props$editor2 = _props$editor2.storage) !== null && _props$editor2 !== void 0 && (_props$editor2 = _props$editor2.markdown) !== null && _props$editor2 !== void 0 && _props$editor2.parser))
+          return false;
+        try {
+          const html = props.editor.storage.markdown.parser.parse(content, {
+            inline: true
+          });
+          return commands.insertContentAt(range, html, options)(props);
+        } catch (e) {
+          console.error("Error inserting content:", e);
+          return false;
+        }
+      }
+    };
+  },
+  onBeforeCreate() {
+    const weakRef = new WeakRef(this);
+    activeExtensions.add(weakRef);
+    scheduleGlobalCleanup();
+    this.editor.storage.markdown = {
+      options: {
+        ...this.options
+      },
+      parser: new MarkdownParser(this.editor, this.options),
+      serializer: new MarkdownSerializer(this.editor),
+      getMarkdown: null
+      // Will be initialized below
+    };
+    this.editor.storage.markdown.getMarkdown = () => {
+      var _editor$storage, _editor$state;
+      const editor = this.editor;
+      if (!(editor !== null && editor !== void 0 && (_editor$storage = editor.storage) !== null && _editor$storage !== void 0 && (_editor$storage = _editor$storage.markdown) !== null && _editor$storage !== void 0 && _editor$storage.serializer) || !((_editor$state = editor.state) !== null && _editor$state !== void 0 && _editor$state.doc)) {
+        return "";
+      }
+      try {
+        return editor.storage.markdown.serializer.serialize(editor.state.doc);
+      } catch (e) {
+        console.error("Error serializing markdown:", e);
+        return "";
+      }
+    };
+    this.editor.options.initialContent = this.editor.options.content;
+    try {
+      const parsedContent = this.editor.storage.markdown.parser.parse(this.editor.options.content);
+      this.editor.options.content = parsedContent;
+    } catch (e) {
+      console.error("Error parsing initial content:", e);
+    }
+  },
+  onCreate() {
+    if (this.editor.options.initialContent !== void 0) {
+      this.editor.options.content = this.editor.options.initialContent;
+      delete this.editor.options.initialContent;
+    }
+  },
+  onDestroy() {
+    try {
+      var _this$editor, _this$editor2;
+      if ((_this$editor = this.editor) !== null && _this$editor !== void 0 && (_this$editor = _this$editor.storage) !== null && _this$editor !== void 0 && (_this$editor = _this$editor.markdown) !== null && _this$editor !== void 0 && (_this$editor = _this$editor.parser) !== null && _this$editor !== void 0 && _this$editor.destroy) {
+        this.editor.storage.markdown.parser.destroy();
+      }
+      if ((_this$editor2 = this.editor) !== null && _this$editor2 !== void 0 && (_this$editor2 = _this$editor2.storage) !== null && _this$editor2 !== void 0 && _this$editor2.markdown) {
+        if (this.editor.storage.markdown.serializer) {
+          this.editor.storage.markdown.serializer.editor = null;
+          this.editor.storage.markdown.serializer = null;
+        }
+        this.editor.storage.markdown.parser = null;
+        this.editor.storage.markdown.getMarkdown = null;
+        this.editor.storage.markdown.options = null;
+        this.editor.storage.markdown = null;
+      }
+      scheduleGlobalCleanup();
+    } catch (e) {
+      console.error("Error during Markdown extension cleanup:", e);
+    }
+  },
+  addStorage() {
+    return {
+      /// storage will be defined in onBeforeCreate() to prevent initial object overriding
+    };
+  },
+  addExtensions() {
+    return [MarkdownTightLists.configure({
+      tight: this.options.tightLists,
+      tightClass: this.options.tightListClass
+    }), MarkdownClipboard.configure({
+      transformPastedText: this.options.transformPastedText,
+      transformCopiedText: this.options.transformCopiedText
+    })];
+  }
+});
+export {
+  Markdown
+};
+//# sourceMappingURL=tiptap-markdown.es.js.map

@@ -10,8 +10,6 @@ import ListItem from "./nodes/list-item";
 import OrderedList from "./nodes/ordered-list";
 import Paragraph from "./nodes/paragraph";
 import Table from "./nodes/table";
-import TaskItem from "./nodes/task-item";
-import TaskList from "./nodes/task-list";
 import Text from "./nodes/text";
 
 import Bold from "./marks/bold";
@@ -35,8 +33,6 @@ export default [
     OrderedList,
     Paragraph,
     Table,
-    TaskItem,
-    TaskList,
     Text,
 
     Bold,
